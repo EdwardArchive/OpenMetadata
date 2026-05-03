@@ -1,6 +1,7 @@
 package org.openmetadata.service.search.opensearch;
 
 import static org.openmetadata.service.search.SearchUtils.buildHttpHostsForHc5;
+import static org.openmetadata.service.search.SearchUtils.buildScopedCredentialsProvider;
 import static org.openmetadata.service.search.SearchUtils.createElasticSearchSSLContext;
 import static org.openmetadata.service.search.SearchUtils.getEntityRelationshipDirection;
 import static org.openmetadata.service.util.AwsCredentialsUtil.buildCredentialsProvider;
@@ -21,12 +22,11 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
-import org.apache.hc.client5.http.auth.AuthScope;
-import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
 import org.apache.hc.core5.http.HttpHost;
+import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
 import org.jetbrains.annotations.NotNull;
 import org.openmetadata.schema.api.entityRelationship.SearchEntityRelationshipRequest;
@@ -104,7 +104,7 @@ public class OpenSearchClient implements SearchClient {
   private final OpenSearchDataInsightAggregatorManager dataInsightAggregatorManager;
   private final OpenSearchSearchManager searchManager;
 
-  private NLQService nlqService;
+  private final NLQService nlqService;
 
   public OpenSearchClient(ElasticSearchConfiguration config) {
     this(config, null);
@@ -255,6 +255,16 @@ public class OpenSearchClient implements SearchClient {
   }
 
   @Override
+  public void updateIndexSettings(String indexName, String settingsJson) {
+    indexManager.updateIndexSettings(indexName, settingsJson);
+  }
+
+  @Override
+  public void forceMerge(String indexName, int maxNumSegments) {
+    indexManager.forceMerge(indexName, maxNumSegments);
+  }
+
+  @Override
   public Set<String> getIndicesByAlias(String aliasName) {
     return indexManager.getIndicesByAlias(aliasName);
   }
@@ -282,6 +292,12 @@ public class OpenSearchClient implements SearchClient {
   @Override
   public Response search(SearchRequest request, SubjectContext subjectContext) throws IOException {
     return searchManager.search(request, subjectContext);
+  }
+
+  @Override
+  public SearchResultListMapper searchForExport(
+      SearchRequest request, SubjectContext subjectContext) throws IOException {
+    return searchManager.searchForExport(request, subjectContext);
   }
 
   @Override
@@ -411,6 +427,14 @@ public class OpenSearchClient implements SearchClient {
   }
 
   @Override
+  public void invalidateLineageCache(String fqn) {
+    if (lineageGraphBuilder == null) {
+      return;
+    }
+    lineageGraphBuilder.invalidateLineageCacheForFqn(fqn);
+  }
+
+  @Override
   public Response searchEntityRelationship(
       String fqn, int upstreamDepth, int downstreamDepth, String queryFilter, boolean deleted)
       throws IOException {
@@ -433,9 +457,10 @@ public class OpenSearchClient implements SearchClient {
   }
 
   @Override
-  public Response searchByField(String fieldName, String fieldValue, String index, Boolean deleted)
+  public Response searchByField(
+      String fieldName, String fieldValue, String index, Boolean deleted, int from, int size)
       throws IOException {
-    return searchManager.searchByField(fieldName, fieldValue, index, deleted);
+    return searchManager.searchByField(fieldName, fieldValue, index, deleted, from, size);
   }
 
   @Override
@@ -804,23 +829,22 @@ public class OpenSearchClient implements SearchClient {
 
             httpClientBuilder.setConnectionManager(connectionManagerBuilder.build());
 
-            if (StringUtils.isNotEmpty(esConfig.getUsername())
-                && StringUtils.isNotEmpty(esConfig.getPassword())) {
-              BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-              credentialsProvider.setCredentials(
-                  new AuthScope(null, -1),
-                  new UsernamePasswordCredentials(
-                      esConfig.getUsername(), esConfig.getPassword().toCharArray()));
+            BasicCredentialsProvider credentialsProvider =
+                buildScopedCredentialsProvider(esConfig, httpHosts);
+            if (credentialsProvider != null) {
               httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
             }
 
             if (esConfig.getKeepAliveTimeoutSecs() != null
                 && esConfig.getKeepAliveTimeoutSecs() > 0) {
               httpClientBuilder.setKeepAliveStrategy(
-                  (response, context) ->
-                      org.apache.hc.core5.util.TimeValue.ofSeconds(
-                          esConfig.getKeepAliveTimeoutSecs()));
+                  (response, context) -> TimeValue.ofSeconds(esConfig.getKeepAliveTimeoutSecs()));
             }
+
+            httpClientBuilder.evictExpiredConnections();
+            httpClientBuilder.evictIdleConnections(TimeValue.ofSeconds(30));
+
+            httpClientBuilder.useSystemProperties();
 
             return httpClientBuilder;
           });
@@ -830,6 +854,17 @@ public class OpenSearchClient implements SearchClient {
               requestConfigBuilder
                   .setConnectTimeout(Timeout.ofSeconds(esConfig.getConnectionTimeoutSecs()))
                   .setResponseTimeout(Timeout.ofSeconds(esConfig.getSocketTimeoutSecs())));
+
+      var defaultFactory =
+          os.org.opensearch.client.transport.httpclient5.ApacheHttpClient5Options.DEFAULT
+              .getHttpAsyncResponseConsumerFactory();
+      os.org.opensearch.client.transport.httpclient5.HttpAsyncResponseConsumerFactory safeFactory =
+          () -> new SafeResponseConsumer<>(defaultFactory.createHttpAsyncResponseConsumer());
+      var optsBuilder =
+          os.org.opensearch.client.transport.httpclient5.ApacheHttpClient5Options.DEFAULT
+              .toBuilder();
+      optsBuilder.setHttpAsyncResponseConsumerFactory(safeFactory);
+      builder.setOptions(optsBuilder.build());
 
       builder.setCompressionEnabled(true);
       builder.setChunkedEnabled(true);

@@ -21,6 +21,7 @@ import static org.openmetadata.service.Entity.TEST_CASE_RESULT;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
@@ -51,6 +52,7 @@ import org.openmetadata.service.workflows.searchIndex.PaginatedEntityTimeSeriesS
  */
 @Slf4j
 public class PartitionWorker {
+  private static final long MAX_CURSOR_INITIALIZATION_OFFSET = (long) Integer.MAX_VALUE + 1L;
 
   /** Time series entity types that need special handling */
   private static final Set<String> TIME_SERIES_ENTITIES =
@@ -485,12 +487,12 @@ public class PartitionWorker {
       String entityType, String keysetCursor, int batchSize, StageStatsTracker statsTracker)
       throws SearchIndexException {
 
-    long t0 = System.currentTimeMillis();
+    long readStartNanos = System.nanoTime();
     ResultList<?> resultList = readEntitiesKeyset(entityType, keysetCursor, batchSize);
-    long t1 = System.currentTimeMillis();
+    long readDurationNanos = System.nanoTime() - readStartNanos;
 
     if (resultList == null || resultList.getData() == null || resultList.getData().isEmpty()) {
-      LOG.debug("{} read={}ms returned empty", entityType, t1 - t0);
+      LOG.debug("{} read={}ms returned empty", entityType, readDurationNanos / 1_000_000L);
       return new BatchResult(0, 0, 0, null);
     }
 
@@ -500,13 +502,31 @@ public class PartitionWorker {
     int warningsCount = resultList.getWarningsCount() != null ? resultList.getWarningsCount() : 0;
 
     if (statsTracker != null) {
-      statsTracker.recordReaderBatch(readSuccessCount, readErrorCount, warningsCount);
+      // Reader timing = wall-clock time of the keyset DB read (listAfter + setFieldsInBulk
+      // hydration). This isolates DB latency from downstream queue / process / sink work.
+      statsTracker.recordReaderBatch(
+          readSuccessCount, readErrorCount, warningsCount, readDurationNanos);
     }
 
     if (failureRecorder != null && readErrorCount > 0) {
       for (EntityError entityError : listOrEmpty(resultList.getErrors())) {
-        String entityId =
-            entityError.getEntity() != null ? entityError.getEntity().toString() : null;
+        Object rawEntity = entityError.getEntity();
+        String entityId = null;
+        if (rawEntity instanceof EntityInterface) {
+          UUID id = ((EntityInterface) rawEntity).getId();
+          if (id != null) {
+            entityId = id.toString();
+          }
+        } else if (rawEntity != null) {
+          entityId = rawEntity.toString();
+        }
+        if (entityId == null) {
+          LOG.warn(
+              "Skipping reader failure record for entityType={}: entityId is null, message={}",
+              entityType,
+              entityError.getMessage());
+          continue;
+        }
         failureRecorder.recordReaderEntityFailure(
             entityType, entityId, null, entityError.getMessage());
       }
@@ -514,15 +534,17 @@ public class PartitionWorker {
 
     Map<String, Object> contextData = createContextData(entityType, statsTracker);
 
+    long readMs = readDurationNanos / 1_000_000L;
     try {
+      long writeStartMs = System.currentTimeMillis();
       writeToSink(entityType, resultList, contextData);
-      long t2 = System.currentTimeMillis();
+      long writeMs = System.currentTimeMillis() - writeStartMs;
       LOG.debug(
           "{} read={}ms write={}ms total={}ms records={}",
           entityType,
-          t1 - t0,
-          t2 - t1,
-          t2 - t0,
+          readMs,
+          writeMs,
+          readMs + writeMs,
           readSuccessCount);
       return new BatchResult(readSuccessCount, readErrorCount, warningsCount, nextCursor);
     } catch (Exception e) {
@@ -575,7 +597,7 @@ public class PartitionWorker {
       return null;
     }
     if (!TIME_SERIES_ENTITIES.contains(entityType)) {
-      int cursorOffset = (int) offset - 1;
+      int cursorOffset = toCursorOffset(entityType, offset);
       ListFilter filter = new ListFilter(Include.ALL);
       String cursor =
           Entity.getEntityRepository(entityType).getCursorAtOffset(filter, cursorOffset);
@@ -590,6 +612,17 @@ public class PartitionWorker {
     } else {
       return RestUtil.encodeCursor(String.valueOf(offset));
     }
+  }
+
+  private int toCursorOffset(String entityType, long offset) {
+    long cursorOffset = offset - 1L;
+    if (cursorOffset > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Keyset cursor initialization for entityType %s does not support offsets above %d",
+              entityType, MAX_CURSOR_INITIALIZATION_OFFSET));
+    }
+    return Math.toIntExact(cursorOffset);
   }
 
   /**

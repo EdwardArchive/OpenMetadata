@@ -82,10 +82,14 @@ public class DistributedSearchIndexCoordinator {
    */
   private static final int MAX_IN_FLIGHT_PARTITIONS_PER_SERVER = 5;
 
+  /** Throttle interval for touching job.updatedAt from partition completions */
+  private static final long JOB_TOUCH_INTERVAL_MS = TimeUnit.MINUTES.toMillis(2);
+
   private final CollectionDAO collectionDAO;
   private final PartitionCalculator partitionCalculator;
   private final String serverId;
   private EntityCompletionTracker entityTracker;
+  private final AtomicLong lastJobTouchTime = new AtomicLong(0);
 
   /** Monotonic counter to guarantee unique claimedAt values across concurrent worker threads. */
   private final AtomicLong claimCounter = new AtomicLong(0);
@@ -451,6 +455,12 @@ public class DistributedSearchIndexCoordinator {
         successCount,
         failedCount);
 
+    // Keep job.updatedAt fresh so OrphanJobMonitor doesn't mark it as orphaned.
+    // This is especially important after recovery when no coordinator lock-refresh loop is running.
+    // Throttled to avoid excessive DB writes — ABANDONED_LOCK_THRESHOLD is 10 min, so every 2 min
+    // is safe.
+    touchJobThrottled(record.jobId(), now);
+
     // Record partition completion for per-entity index promotion
     if (entityTracker != null) {
       LOG.debug(
@@ -464,6 +474,18 @@ public class DistributedSearchIndexCoordinator {
 
     // Check if job should be marked as complete
     checkAndUpdateJobCompletion(UUID.fromString(record.jobId()));
+  }
+
+  private void touchJobThrottled(String jobId, long now) {
+    long last = lastJobTouchTime.get();
+    if (now - last < JOB_TOUCH_INTERVAL_MS || !lastJobTouchTime.compareAndSet(last, now)) {
+      return;
+    }
+    try {
+      collectionDAO.searchIndexJobDAO().touchJob(jobId, now);
+    } catch (Exception e) {
+      LOG.debug("Failed to touch job updatedAt for {}: {}", jobId, e.getMessage());
+    }
   }
 
   /**
@@ -638,6 +660,15 @@ public class DistributedSearchIndexCoordinator {
     // Get per-entity stats
     List<EntityStatsRecord> entityStatsList = partitionDAO.getEntityStats(jobId.toString());
 
+    // Per-entity timing comes from search_index_server_stats (the per-stage tracker), keyed
+    // by entityType. Lookup once into a map to avoid an O(N*M) match in the loop below.
+    Map<String, CollectionDAO.SearchIndexServerStatsDAO.EntityStats> entityTimingByType =
+        new HashMap<>();
+    for (CollectionDAO.SearchIndexServerStatsDAO.EntityStats e :
+        collectionDAO.searchIndexServerStatsDAO().getStatsByEntityType(jobId.toString())) {
+      entityTimingByType.put(e.entityType(), e);
+    }
+
     Map<String, SearchIndexJob.EntityTypeStats> entityStatsMap = new HashMap<>();
     // Calculate totals from entity stats for consistency (entity stats are always accurate)
     long totalProcessed = 0;
@@ -645,6 +676,8 @@ public class DistributedSearchIndexCoordinator {
     long totalFailed = 0;
 
     for (EntityStatsRecord es : entityStatsList) {
+      CollectionDAO.SearchIndexServerStatsDAO.EntityStats timing =
+          entityTimingByType.get(es.entityType());
       entityStatsMap.put(
           es.entityType(),
           SearchIndexJob.EntityTypeStats.builder()
@@ -656,10 +689,22 @@ public class DistributedSearchIndexCoordinator {
               .totalPartitions(es.totalPartitions())
               .completedPartitions(es.completedPartitions())
               .failedPartitions(es.failedPartitions())
+              .readerTimeMs(timing != null ? timing.readerTimeMs() : 0)
+              .processTimeMs(timing != null ? timing.processTimeMs() : 0)
+              .sinkTimeMs(timing != null ? timing.sinkTimeMs() : 0)
+              .vectorTimeMs(timing != null ? timing.vectorTimeMs() : 0)
               .build());
       totalProcessed += es.processedRecords();
       totalSuccess += es.successRecords();
       totalFailed += es.failedRecords();
+    }
+
+    // Per-server timing comes from search_index_server_stats grouped by serverId.
+    Map<String, CollectionDAO.SearchIndexServerStatsDAO.ServerTimingStats> serverTimingById =
+        new HashMap<>();
+    for (CollectionDAO.SearchIndexServerStatsDAO.ServerTimingStats s :
+        collectionDAO.searchIndexServerStatsDAO().getStatsByServer(jobId.toString())) {
+      serverTimingById.put(s.serverId(), s);
     }
 
     // Get per-server stats for distributed visibility
@@ -673,6 +718,8 @@ public class DistributedSearchIndexCoordinator {
           ss.processedRecords(),
           ss.successRecords(),
           ss.failedRecords());
+      CollectionDAO.SearchIndexServerStatsDAO.ServerTimingStats timing =
+          serverTimingById.get(ss.serverId());
       serverStatsMap.put(
           ss.serverId(),
           SearchIndexJob.ServerStats.builder()
@@ -683,6 +730,10 @@ public class DistributedSearchIndexCoordinator {
               .totalPartitions(ss.totalPartitions())
               .completedPartitions(ss.completedPartitions())
               .processingPartitions(ss.processingPartitions())
+              .readerTimeMs(timing != null ? timing.readerTimeMs() : 0)
+              .processTimeMs(timing != null ? timing.processTimeMs() : 0)
+              .sinkTimeMs(timing != null ? timing.sinkTimeMs() : 0)
+              .vectorTimeMs(timing != null ? timing.vectorTimeMs() : 0)
               .build());
     }
 

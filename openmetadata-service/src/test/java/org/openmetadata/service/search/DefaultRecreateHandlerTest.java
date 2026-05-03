@@ -834,7 +834,7 @@ class DefaultRecreateHandlerTest {
               invocation -> {
                 String index = invocation.getArgument(0);
                 @SuppressWarnings("unchecked")
-                Set<String> aliases = new HashSet<>((Set<String>) invocation.getArgument(1));
+                Set<String> aliases = new HashSet<>(invocation.getArgument(1));
                 indexAliases.computeIfPresent(
                     index,
                     (k, v) -> {
@@ -851,7 +851,7 @@ class DefaultRecreateHandlerTest {
               invocation -> {
                 String index = invocation.getArgument(0);
                 @SuppressWarnings("unchecked")
-                Set<String> aliases = new HashSet<>((Set<String>) invocation.getArgument(1));
+                Set<String> aliases = new HashSet<>(invocation.getArgument(1));
                 indexAliases.computeIfAbsent(index, k -> new HashSet<>()).addAll(aliases);
                 return null;
               })
@@ -863,10 +863,10 @@ class DefaultRecreateHandlerTest {
           .doAnswer(
               invocation -> {
                 @SuppressWarnings("unchecked")
-                Set<String> oldIndices = (Set<String>) invocation.getArgument(0);
+                Set<String> oldIndices = invocation.getArgument(0);
                 String newIndex = invocation.getArgument(1);
                 @SuppressWarnings("unchecked")
-                Set<String> aliases = new HashSet<>((Set<String>) invocation.getArgument(2));
+                Set<String> aliases = new HashSet<>(invocation.getArgument(2));
 
                 // Remove aliases from old indices
                 for (String oldIndex : oldIndices) {
@@ -911,10 +911,10 @@ class DefaultRecreateHandlerTest {
           .doAnswer(
               invocation -> {
                 @SuppressWarnings("unchecked")
-                Set<String> oldIndices = (Set<String>) invocation.getArgument(0);
+                Set<String> oldIndices = invocation.getArgument(0);
                 String newIndex = invocation.getArgument(1);
                 @SuppressWarnings("unchecked")
-                Set<String> aliases = new HashSet<>((Set<String>) invocation.getArgument(2));
+                Set<String> aliases = new HashSet<>(invocation.getArgument(2));
 
                 // Remove aliases from old indices
                 for (String oldIndex : oldIndices) {
@@ -933,6 +933,100 @@ class DefaultRecreateHandlerTest {
           .swapAliases(anySet(), anyString(), anySet());
 
       return client;
+    }
+  }
+
+  @Nested
+  @DisplayName("buildRevertJson Tests")
+  class BuildRevertJsonTests {
+
+    @Test
+    @DisplayName("Returns null when both live and bulk are unset")
+    void noConfig() {
+      assertEquals(null, DefaultRecreateHandler.buildRevertJson(null, null));
+    }
+
+    @Test
+    @DisplayName("Returns only fields the admin set when bulk overrides were not applied")
+    void liveOnlyWithoutBulk() {
+      org.openmetadata.schema.system.IndexSettings live =
+          new org.openmetadata.schema.system.IndexSettings()
+              .withRefreshInterval("30s")
+              .withNumberOfReplicas(2);
+      String json = DefaultRecreateHandler.buildRevertJson(live, null);
+      assertNotNull(json);
+      assertTrue(json.contains("\"refresh_interval\":\"30s\""));
+      assertTrue(json.contains("\"number_of_replicas\":2"));
+      // No bulk → no implicit safety fields
+      assertFalse(json.contains("\"translog\""));
+    }
+
+    @Test
+    @DisplayName("Bulk override + missing live: revert fills safe defaults for every bulk field")
+    void bulkOverrideTriggersFullRevert() {
+      org.openmetadata.schema.system.BulkIndexOverrides bulk =
+          new org.openmetadata.schema.system.BulkIndexOverrides()
+              .withRefreshInterval("-1")
+              .withNumberOfReplicas(0)
+              .withTranslogDurability(
+                  org.openmetadata.schema.system.BulkIndexOverrides.TranslogDurability.ASYNC)
+              .withTranslogSyncInterval("30s");
+      String json = DefaultRecreateHandler.buildRevertJson(null, bulk);
+      assertNotNull(json);
+      // Every field bulk touched gets a safe live default — never the bulk value.
+      assertTrue(json.contains("\"refresh_interval\":\"1s\""));
+      assertTrue(json.contains("\"number_of_replicas\":1"));
+      // Translog fields land in a nested object — what the OS/ES typed IndexSettings
+      // model expects when its _DESERIALIZER parses the body.
+      assertTrue(json.contains("\"translog\":{"));
+      assertTrue(json.contains("\"durability\":\"request\""));
+      assertTrue(json.contains("\"sync_interval\":\"5s\""));
+    }
+
+    @Test
+    @DisplayName(
+        "Partial live + full bulk: live values win, bulk-only fields fall back to defaults")
+    void partialLiveOverridesBulk() {
+      // Admin only set translogDurability on live; bulk disabled refresh, replicas, both translog
+      // fields. Expectation: translogDurability comes from live; the rest fall back to safe
+      // defaults (NOT bulk values).
+      org.openmetadata.schema.system.IndexSettings live =
+          new org.openmetadata.schema.system.IndexSettings()
+              .withTranslogDurability(
+                  org.openmetadata.schema.system.IndexSettings.TranslogDurability.REQUEST);
+      org.openmetadata.schema.system.BulkIndexOverrides bulk =
+          new org.openmetadata.schema.system.BulkIndexOverrides()
+              .withRefreshInterval("-1")
+              .withNumberOfReplicas(0)
+              .withTranslogDurability(
+                  org.openmetadata.schema.system.BulkIndexOverrides.TranslogDurability.ASYNC)
+              .withTranslogSyncInterval("30s");
+      String json = DefaultRecreateHandler.buildRevertJson(live, bulk);
+      assertNotNull(json);
+      assertTrue(json.contains("\"refresh_interval\":\"1s\""));
+      assertTrue(json.contains("\"number_of_replicas\":1"));
+      // Translog fields land in a nested object — what the OS/ES typed IndexSettings
+      // model expects when its _DESERIALIZER parses the body.
+      assertTrue(json.contains("\"translog\":{"));
+      assertTrue(json.contains("\"durability\":\"request\""));
+      assertTrue(json.contains("\"sync_interval\":\"5s\""));
+    }
+
+    @Test
+    @DisplayName("Bulk JSON properly escapes admin-supplied string values")
+    void bulkSettingsEscapesQuotesInValues() {
+      // Hostile / unusual but legal admin input — quote, backslash, newline. Naive string
+      // concatenation would produce invalid JSON; Jackson must escape these.
+      org.openmetadata.schema.system.BulkIndexOverrides bulk =
+          new org.openmetadata.schema.system.BulkIndexOverrides()
+              .withRefreshInterval("3s\"; \\rogue")
+              .withTranslogSyncInterval("60s\n");
+      String json = DefaultRecreateHandler.buildBulkSettingsJson(bulk);
+      assertNotNull(json);
+      // Must round-trip parse — the strongest evidence escaping worked.
+      org.openmetadata.schema.utils.JsonUtils.readTree(json);
+      assertTrue(json.contains("\\\"")); // escaped quote present
+      assertTrue(json.contains("\\\\")); // escaped backslash present
     }
   }
 }

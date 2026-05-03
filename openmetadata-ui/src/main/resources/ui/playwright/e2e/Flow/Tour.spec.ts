@@ -11,10 +11,10 @@
  *  limitations under the License.
  */
 import { expect, Page, test } from '@playwright/test';
+import { PLAYWRIGHT_BASIC_TEST_TAG_OBJ } from '../../constant/config';
 import { UserClass } from '../../support/user/UserClass';
 import { performAdminLogin } from '../../utils/admin';
 import { waitForAllLoadersToDisappear } from '../../utils/entity';
-import { PLAYWRIGHT_BASIC_TEST_TAG_OBJ } from '../../constant/config';
 
 const user = new UserClass();
 
@@ -189,14 +189,28 @@ test.describe(
     });
 
     test('Tour should work from welcome screen', async ({ page }) => {
-      await page
+      test.slow();
+
+      const isAlertVisible = await page
         .getByTestId('whats-new-alert-card')
-        .locator('.whats-new-alert-close')
-        .click();
+        .isVisible();
+      if (isAlertVisible) {
+        await page
+          .getByTestId('whats-new-alert-card')
+          .locator('.whats-new-alert-close')
+          .click();
+      }
       await page.getByText('Take a product tour to get started!').click();
+      await page.waitForURL('**/tour');
       await waitForAllLoadersToDisappear(page);
       await waitForAllLoadersToDisappear(page, 'entity-list-skeleton');
-      await page.waitForURL('**/tour');
+
+      const isWelcomeScreenVisible = await page
+        .getByTestId('welcome-screen')
+        .isVisible();
+      if (isWelcomeScreenVisible) {
+        await page.getByTestId('welcome-screen-close-btn').click();
+      }
 
       await page.locator('#feedWidgetData').waitFor();
       // Since the tour steps are already tested in the first test,

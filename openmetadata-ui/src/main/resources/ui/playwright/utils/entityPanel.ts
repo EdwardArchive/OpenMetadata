@@ -25,17 +25,47 @@ export const getEntityFqn = (
   ).entityResponseData?.fullyQualifiedName;
 };
 
-export const openEntitySummaryPanel = async (
-  page: Page,
-  entityName: string,
-  endpoint?: string,
-  fullyQualifiedName?: string
-) => {
-  if (
-    endpoint &&
-    ENDPOINT_TO_FILTER_MAP[endpoint] &&
-    ENDPOINT_TO_FILTER_MAP[endpoint] !== 'Search Index'
-  ) {
+const findOptionByScrolling = async (page: Page, endpoint: string) => {
+  let tries = 0;
+  const maxTries = 5; // Limit the number of scroll attempts to prevent infinite loops
+  const filterName = ENDPOINT_TO_FILTER_MAP[endpoint];
+  const dropdown = page
+    .getByTestId('global-search-select-dropdown')
+    .locator('.rc-virtual-list-holder');
+  const option = page.getByTestId(`global-search-select-option-${filterName}`);
+  while (tries < maxTries) {
+    if (await option.isVisible()) {
+      await option.click();
+      return;
+    }
+    // Scroll the dropdown to load more options
+    await dropdown.evaluate((element) => {
+      element.scrollBy(0, 100); // Adjust scroll amount as needed
+    });
+    tries++;
+  }
+  await dropdown.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  throw new Error(
+    `Unable to find global search filter option "${filterName}" for endpoint "${endpoint}" after ${maxTries} scroll attempts.`
+  );
+};
+
+export const openEntitySummaryPanel = async ({
+  page,
+  entityName,
+  endpoint,
+  fullyQualifiedName,
+  exploreTab,
+}: {
+  page: Page;
+  entityName: string;
+  endpoint?: string;
+  fullyQualifiedName?: string;
+  exploreTab?: string;
+}) => {
+  if (endpoint && ENDPOINT_TO_FILTER_MAP[endpoint]) {
     await page.getByTestId('global-search-selector').waitFor({
       state: 'visible',
     });
@@ -43,11 +73,7 @@ export const openEntitySummaryPanel = async (
     await page.getByTestId('global-search-select-dropdown').waitFor({
       state: 'visible',
     });
-    await page
-      .getByTestId(
-        `global-search-select-option-${ENDPOINT_TO_FILTER_MAP[endpoint]}`
-      )
-      .click();
+    await findOptionByScrolling(page, endpoint);
   }
   const searchResponsePromise = page.waitForResponse((response) =>
     response.url().includes('/api/v1/search/query')
@@ -61,27 +87,41 @@ export const openEntitySummaryPanel = async (
   await page.getByTestId('searchBox').press('Enter');
   await waitForAllLoadersToDisappear(page);
 
+  if (exploreTab) {
+    const tab = page
+      .getByTestId('explore-left-panel')
+      .getByRole('menuitem', { name: exploreTab });
+    await tab.waitFor({ state: 'visible' });
+    await tab.click();
+    await waitForAllLoadersToDisappear(page);
+  }
+
   if (fullyQualifiedName) {
     const cardByFqn = page.getByTestId(`table-data-card_${fullyQualifiedName}`);
     await cardByFqn.waitFor({ state: 'visible' });
+
+    // Since the directly clicking on the card can sometimes click on title element which is link,
+    // we need to click on description container to open the summary panel.
+    await cardByFqn.getByTestId('description-text').click();
+
     return;
   }
 
-  const entityCard = page
-    .locator('[data-testid="table-data-card"]')
-    .filter({ hasText: entityName })
-    .first();
-
-  const isCardVisible = await entityCard.isVisible().catch(() => false);
-  if (isCardVisible) {
-    await entityCard.click();
-  }
+  await page
+    .locator('[data-testid^="table-data-card"]')
+    .filter({
+      has: page.getByTestId('entity-link').filter({ hasText: entityName }),
+    })
+    .getByTestId('description-text')
+    .click();
 };
 // ... (lines 48-468 unchanged)
 export async function navigateToExploreAndSelectTable(
   page: Page,
   entityName: string,
-  endpoint?: string
+  endpoint?: string,
+  exploreTab?: string,
+  fullyQualifiedName?: string
 ) {
   await redirectToExplorePage(page);
 
@@ -91,7 +131,13 @@ export async function navigateToExploreAndSelectTable(
     response.url().includes('/permissions')
   );
 
-  await openEntitySummaryPanel(page, entityName, endpoint);
+  await openEntitySummaryPanel({
+    page,
+    entityName,
+    endpoint,
+    exploreTab,
+    fullyQualifiedName,
+  });
 
   const permissionsResponse = await permissionsResponsePromise;
   expect(permissionsResponse.status()).toBe(200);
