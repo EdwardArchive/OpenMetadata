@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.exception.ExceptionUtils;
@@ -88,6 +89,8 @@ import org.openmetadata.service.util.WebsocketNotificationHandler;
 public class CreateTask implements TaskListener {
   static final String PENDING_WORKFLOW_START_STAGE_ID = "pending-workflow-start";
   private static final String DEFAULT_SYSTEM_USER = "admin";
+  private static final String SUPERSEDED_BY_NEWER_RUN =
+      "Superseded by a newer approval workflow run for the same entity";
   private static final int WORKFLOW_MANAGED_DRAFT_LOOKUP_MAX_ATTEMPTS = 6;
   private static final long INITIAL_WORKFLOW_MANAGED_DRAFT_LOOKUP_DELAY_MILLIS = 25L;
   private static final long MAX_WORKFLOW_MANAGED_DRAFT_LOOKUP_DELAY_MILLIS = 250L;
@@ -585,6 +588,19 @@ public class CreateTask implements TaskListener {
               new com.fasterxml.jackson.core.type.TypeReference<List<TagLabel>>() {}));
     }
 
+    // A genuinely new approval run is materializing a task for this entity. Supersede any approval
+    // task still open from an earlier run of the same workflow before creating the new one, so a
+    // single live approval is maintained and the earlier run's orphaned Flowable process is cleaned
+    // up. Cancel-before-create keeps the "exactly one open" invariant.
+    supersedePriorApprovalTask(
+        delegateTask,
+        taskRepository,
+        entity,
+        taskCategory,
+        resolvedWorkflowDefinitionId,
+        workflowInstanceId,
+        updatedBy);
+
     // Use the repository to create (handles taskId generation, FQN, relationships)
     task = taskRepository.create(null, task);
 
@@ -606,6 +622,73 @@ public class CreateTask implements TaskListener {
     WebsocketNotificationHandler.handleTaskNotification(task);
 
     return task;
+  }
+
+  private void supersedePriorApprovalTask(
+      DelegateTask delegateTask,
+      TaskRepository taskRepository,
+      EntityInterface entity,
+      TaskCategory taskCategory,
+      UUID currentWorkflowDefinitionId,
+      UUID currentWorkflowInstanceId,
+      String updatedBy) {
+    // Best-effort cleanup: failing to supersede the prior task must never abort creation of the new
+    // approval task, so all exceptions are contained here instead of bubbling up as a BpmnError.
+    try {
+      Task prior =
+          taskCategory == TaskCategory.Approval
+              ? taskRepository.findOpenTaskByEntityAndCategory(
+                  entity.getFullyQualifiedName(), taskCategory)
+              : null;
+      if (isSupersedablePriorApprovalTask(
+          prior, currentWorkflowDefinitionId, currentWorkflowInstanceId)) {
+        cancelAndTerminatePriorApproval(delegateTask, taskRepository, prior, updatedBy);
+      }
+    } catch (Exception e) {
+      LOG.warn(
+          "[CreateTask] Failed to supersede prior approval task for entity '{}': {}",
+          entity.getFullyQualifiedName(),
+          e.getMessage());
+    }
+  }
+
+  static boolean isSupersedablePriorApprovalTask(
+      Task prior, UUID currentWorkflowDefinitionId, UUID currentWorkflowInstanceId) {
+    return prior != null
+        && prior.getWorkflowInstanceId() != null
+        && !prior.getWorkflowInstanceId().equals(currentWorkflowInstanceId)
+        && currentWorkflowDefinitionId != null
+        && currentWorkflowDefinitionId.equals(prior.getWorkflowDefinitionId());
+  }
+
+  private void cancelAndTerminatePriorApproval(
+      DelegateTask delegateTask, TaskRepository taskRepository, Task prior, String updatedBy) {
+    LOG.info(
+        "[CreateTask] Superseding prior approval task '{}' (workflowInstance '{}') with a newer run",
+        prior.getId(),
+        prior.getWorkflowInstanceId());
+    taskRepository.closeTask(prior, updatedBy, SUPERSEDED_BY_NEWER_RUN);
+    dispatchPriorInstanceTermination(delegateTask, prior.getWorkflowInstanceId());
+  }
+
+  private void dispatchPriorInstanceTermination(DelegateTask delegateTask, UUID priorInstanceId) {
+    String mainWorkflowName = inferWorkflowDefinitionRef(delegateTask);
+    // Dispatched async on purpose: deleteProcessInstance() then runs in its own Flowable command
+    // context, so a DB-level failure terminating the superseded process can never poison — or roll
+    // back — the current run's transaction, which has just created the replacement task.
+    CompletableFuture.runAsync(
+            () ->
+                WorkflowHandler.getInstance()
+                    .terminateWorkflowInstance(
+                        priorInstanceId, mainWorkflowName, SUPERSEDED_BY_NEWER_RUN))
+        .exceptionally(
+            ex -> {
+              LOG.error(
+                  "[CreateTask] Failed to terminate superseded workflow instance '{}'",
+                  priorInstanceId,
+                  ex);
+              return null;
+            });
   }
 
   static List<EntityReference> resolveExistingTaskAssignees(
