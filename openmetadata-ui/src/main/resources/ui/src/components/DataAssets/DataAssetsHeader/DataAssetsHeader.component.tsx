@@ -99,8 +99,8 @@ import { getDarButtonTooltip } from '../../../utils/TasksUtils';
 import { showErrorToast } from '../../../utils/ToastUtils';
 import { useRequiredParams } from '../../../utils/useRequiredParams';
 import Certification from '../../Certification/Certification.component';
+import AnnouncementsWidgetV2Body from '../../common/AnnouncementsWidget/AnnouncementsWidgetV2Body.component';
 import CertificationTag from '../../common/CertificationTag/CertificationTag';
-import AnnouncementCard from '../../common/EntityPageInfos/AnnouncementCard/AnnouncementCard';
 import AnnouncementDrawer from '../../common/EntityPageInfos/AnnouncementDrawer/AnnouncementDrawer';
 import ManageButton from '../../common/EntityPageInfos/ManageButton/ManageButton';
 import { EditIconButton } from '../../common/IconButtons/EditIconButton';
@@ -245,8 +245,9 @@ export const DataAssetsHeader = ({
 
   const [isAnnouncementDrawerOpen, setIsAnnouncementDrawerOpen] =
     useState<boolean>(false);
-  const [activeAnnouncement, setActiveAnnouncement] =
-    useState<AnnouncementEntity>();
+  const [activeAnnouncements, setActiveAnnouncements] = useState<
+    AnnouncementEntity[]
+  >([]);
 
   const fetchDQFailureCount = async () => {
     if (!tableClassBase.getAlertEnableStatus() || !isDqAlertSupported) {
@@ -329,7 +330,7 @@ export const DataAssetsHeader = ({
       );
 
       if (!isEmpty(announcements.data)) {
-        setActiveAnnouncement(announcements.data[0]);
+        setActiveAnnouncements(announcements.data);
       }
     } catch (error) {
       showErrorToast(error as AxiosError);
@@ -937,13 +938,6 @@ export const DataAssetsHeader = ({
           </div>
         </div>
 
-        {activeAnnouncement && (
-          <AnnouncementCard
-            announcement={activeAnnouncement}
-            onClick={handleOpenAnnouncementDrawer}
-          />
-        )}
-
         <div
           className="tw:flex tw:flex-wrap tw:items-start tw:gap-[18px]"
           data-testid="data-asset-header-metadata">
@@ -1139,6 +1133,16 @@ export const DataAssetsHeader = ({
           {extraInfo}
         </div>
       </div>
+
+      {activeAnnouncements.length > 0 && (
+        <AnnouncementsWidgetV2Body
+          hideEntityName
+          announcements={activeAnnouncements}
+          className="tw:mt-3"
+          testId="entity-header-announcements"
+          onItemClick={handleOpenAnnouncementDrawer}
+        />
+      )}
 
       {isAnnouncementDrawerOpen && (
         <AnnouncementDrawer
